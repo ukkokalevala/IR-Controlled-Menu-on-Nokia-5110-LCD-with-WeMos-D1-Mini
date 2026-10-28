@@ -1,0 +1,335 @@
+/*
+ * IR-Controlled 2-Page Menu on Nokia 5110 LCD
+ * COMPLETE — fixed LCD layout, no overlap
+ *
+ * Board : WeMos D1 Mini
+ * LCD   : Nokia 5110 — RST D2, CE D1, DC D6, DIN D7, CLK D5
+ * IR    : VS1838B on D4  (NOT D0 — GPIO16 has no interrupt support)
+ * LED   : D8 (via 220Ω to GND)
+ *
+ * Controls:
+ *   ▲ ▼         navigate cursor
+ *   ◀◀ ▶▶       page back / forward
+ *   ▶ Play      select / activate
+ *   ■ Stop      back / cancel
+ *   EQ          cycle LCD contrast
+ *   ST/Rept     toggle repeat mode
+ *   VOL+ VOL−   adjust blink speed
+ *   1-9         direct item select
+ *
+ * Serial Monitor: 9600 baud
+ */
+
+#include <IRremoteESP8266.h>
+#include <IRrecv.h>
+#include <IRutils.h>
+
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_PCD8544.h>
+
+// -------- Nokia 5110 pins --------
+// Adafruit_PCD8544(CLK, DIN, DC, CE, RST)
+Adafruit_PCD8544 display = Adafruit_PCD8544(D5, D7, D6, D1, D2);
+
+// -------- IR --------
+const uint16_t IR_PIN = D4;          // GPIO2 — WORKS (D0 does not!)
+IRrecv irrecv(IR_PIN, 1024, 15, true);
+decode_results results;
+
+// -------- LED --------
+const uint8_t LED_PIN = D8;          // GPIO15
+
+// ============================================================
+//  CONFIRMED NEC REMOTE CODES (all Bits = 32)
+// ============================================================
+const uint32_t BTN_1     = 0x00FF30CF;
+const uint32_t BTN_2     = 0x00FF18E7;
+const uint32_t BTN_3     = 0x00FF7A85;
+const uint32_t BTN_4     = 0x00FF10EF;
+const uint32_t BTN_5     = 0x00FF38C7;
+const uint32_t BTN_6     = 0x00FF5AA5;
+const uint32_t BTN_7     = 0x00FF42BD;
+const uint32_t BTN_8     = 0x00FF4AB5;
+const uint32_t BTN_9     = 0x00FF52AD;
+const uint32_t BTN_0     = 0x00FF6897;
+
+const uint32_t BTN_UP    = 0x00FF906F;
+const uint32_t BTN_DOWN  = 0x00FFE01F;
+const uint32_t BTN_LEFT  = 0x00FF22DD;
+const uint32_t BTN_RIGHT = 0x00FFC23D;
+
+const uint32_t BTN_OK    = 0x00FF02FD;   // Play
+const uint32_t BTN_STOP  = 0x00FFE21D;   // Stop / back
+const uint32_t BTN_EQ    = 0x00FF9867;   // EQ
+const uint32_t BTN_REPT  = 0x00FFB04F;   // ST/Rept
+
+const uint32_t BTN_PLUS  = 0x00FF629D;   // VOL+
+const uint32_t BTN_MINUS = 0x00FFA857;   // VOL-
+// ============================================================
+
+// -------- Menu data --------
+const char* page0Items[] = {"LED ON", "LED OFF", "BLINK SLOW", "BLINK FAST"};
+const uint8_t PAGE0_COUNT = 4;
+
+const char* page1Items[] = {"SHOW CODES", "RESET", "ABOUT"};
+const uint8_t PAGE1_COUNT = 3;
+
+uint8_t currentPage = 0;
+uint8_t menuIndex   = 0;
+
+// -------- LED state --------
+enum LedMode { LED_OFF, LED_ON, BLINK_SLOW, BLINK_FAST };
+LedMode ledMode = LED_OFF;
+bool ledState = false;
+unsigned long lastBlink = 0;
+unsigned long blinkInterval = 0;
+
+uint16_t slowInterval = 800;
+uint16_t fastInterval = 150;
+
+// -------- Extras --------
+uint8_t contrastLevel = 50;
+bool repeatMode = false;
+
+// ================= HELPERS =================
+uint8_t itemCountForPage(uint8_t page) {
+  return (page == 0) ? PAGE0_COUNT : PAGE1_COUNT;
+}
+
+const char* itemForPage(uint8_t page, uint8_t idx) {
+  return (page == 0) ? page0Items[idx] : page1Items[idx];
+}
+
+const char* pageTitle(uint8_t page) {
+  return (page == 0) ? "LED CONTROL" : "SETTINGS";
+}
+
+const char* stateText() {
+  switch (ledMode) {
+    case LED_OFF:    return "OFF";
+    case LED_ON:     return "ON";
+    case BLINK_SLOW: return "SLOW";
+    case BLINK_FAST: return "FAST";
+  }
+  return "?";
+}
+
+// ================= FIXED LCD LAYOUT =================
+// 84x48 pixels, 6 rows of 8 pixels each:
+//   Row 0 (Y=0)  : title + page number
+//   Row 1 (Y=8)  : item 1
+//   Row 2 (Y=16) : item 2
+//   Row 3 (Y=24) : item 3
+//   Row 4 (Y=32) : item 4
+//   Row 5 (Y=40) : status
+// NO separator lines in the middle — they caused the overlap.
+void drawMenu() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(BLACK);
+
+  // Row 0 — title + page indicator
+  display.setCursor(0, 0);
+  display.print(pageTitle(currentPage));
+  display.setCursor(66, 0);
+  display.print(currentPage + 1);
+  display.print("/2");
+
+  // Rows 1-4 — menu items
+  uint8_t count = itemCountForPage(currentPage);
+  for (uint8_t i = 0; i < count; i++) {
+    display.setCursor(0, 8 + i * 8);
+    display.print(i == menuIndex ? ">" : " ");
+    display.print(i + 1);
+    display.print(" ");
+    display.print(itemForPage(currentPage, i));
+  }
+
+  // Row 5 — status
+  display.setCursor(0, 40);
+  display.print("State:");
+  display.print(stateText());
+  if (repeatMode) display.print(" R");
+
+  display.display();
+}
+
+void applySelection() {
+  if (currentPage == 0) {
+    switch (menuIndex) {
+      case 0:
+        ledMode = LED_ON;
+        blinkInterval = 0;
+        digitalWrite(LED_PIN, HIGH);
+        ledState = true;
+        break;
+      case 1:
+        ledMode = LED_OFF;
+        blinkInterval = 0;
+        digitalWrite(LED_PIN, LOW);
+        ledState = false;
+        break;
+      case 2:
+        ledMode = BLINK_SLOW;
+        blinkInterval = slowInterval;
+        lastBlink = millis();
+        break;
+      case 3:
+        ledMode = BLINK_FAST;
+        blinkInterval = fastInterval;
+        lastBlink = millis();
+        break;
+    }
+  } else {
+    switch (menuIndex) {
+      case 0: /* SHOW CODES — placeholder */ break;
+      case 1: /* RESET — placeholder */      break;
+      case 2: /* ABOUT — placeholder */      break;
+    }
+  }
+  drawMenu();
+}
+
+void updateLed() {
+  if (blinkInterval == 0) return;
+  unsigned long now = millis();
+  if (now - lastBlink >= blinkInterval) {
+    lastBlink = now;
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+  }
+}
+
+void handlePlus() {
+  if (slowInterval > 100) slowInterval -= 100;
+  if (fastInterval > 50)  fastInterval -= 25;
+  if (ledMode == BLINK_SLOW) blinkInterval = slowInterval;
+  if (ledMode == BLINK_FAST) blinkInterval = fastInterval;
+  drawMenu();
+}
+
+void handleMinus() {
+  if (slowInterval < 3000) slowInterval += 100;
+  if (fastInterval < 1000) fastInterval += 25;
+  if (ledMode == BLINK_SLOW) blinkInterval = slowInterval;
+  if (ledMode == BLINK_FAST) blinkInterval = fastInterval;
+  drawMenu();
+}
+
+void handleEQ() {
+  contrastLevel += 10;
+  if (contrastLevel > 70) contrastLevel = 30;
+  display.setContrast(contrastLevel);
+  Serial.print(F("Contrast: "));
+  Serial.println(contrastLevel);
+}
+
+void handleRept() {
+  repeatMode = !repeatMode;
+  Serial.print(F("Repeat: "));
+  Serial.println(repeatMode ? "ON" : "OFF");
+  drawMenu();
+}
+
+void handleStop() {
+  currentPage = 0;
+  menuIndex   = 0;
+  drawMenu();
+}
+
+bool handleNumberKey(uint32_t code) {
+  const uint32_t keys[9] = {
+    BTN_1, BTN_2, BTN_3, BTN_4, BTN_5, BTN_6, BTN_7, BTN_8, BTN_9
+  };
+  for (uint8_t n = 0; n < 9; n++) {
+    if (code == keys[n]) {
+      uint8_t count = itemCountForPage(currentPage);
+      if (n < count) {
+        menuIndex = n;
+        applySelection();
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+// ================= SETUP / LOOP =================
+void setup() {
+  Serial.begin(9600);       // 9600 — reliable on this board
+  delay(500);
+  Serial.println();
+  Serial.println(F("=== IR Menu Ready ==="));
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  display.begin();
+  display.setRotation(2);
+  display.setContrast(contrastLevel);
+
+  irrecv.enableIRIn();
+  drawMenu();
+  Serial.println(F("Press any remote button."));
+}
+
+void loop() {
+  updateLed();
+
+  if (!irrecv.decode(&results)) return;
+
+  // Ignore repeat frames
+  if (results.value == 0xFFFFFFFF || results.repeat) {
+    irrecv.resume();
+    return;
+  }
+
+  uint32_t code = (uint32_t)results.value;
+
+  Serial.print(F("RX=0x"));
+  Serial.println(code, HEX);
+
+  if (code == BTN_UP) {
+    if (menuIndex == 0) menuIndex = itemCountForPage(currentPage) - 1;
+    else                menuIndex--;
+    drawMenu();
+  }
+  else if (code == BTN_DOWN) {
+    menuIndex = (menuIndex + 1) % itemCountForPage(currentPage);
+    drawMenu();
+  }
+  else if (code == BTN_LEFT) {
+    currentPage = (currentPage == 0) ? 1 : currentPage - 1;
+    menuIndex = 0;
+    drawMenu();
+  }
+  else if (code == BTN_RIGHT) {
+    currentPage = (currentPage + 1) % 2;
+    menuIndex = 0;
+    drawMenu();
+  }
+  else if (code == BTN_OK) {
+    applySelection();
+  }
+  else if (code == BTN_STOP) {
+    handleStop();
+  }
+  else if (code == BTN_EQ) {
+    handleEQ();
+  }
+  else if (code == BTN_REPT) {
+    handleRept();
+  }
+  else if (code == BTN_PLUS) {
+    handlePlus();
+  }
+  else if (code == BTN_MINUS) {
+    handleMinus();
+  }
+  else {
+    handleNumberKey(code);
+  }
+
+  irrecv.resume();
+}
